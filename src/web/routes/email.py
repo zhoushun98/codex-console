@@ -15,6 +15,7 @@ from ...database.models import EmailService as EmailServiceModel
 from ...database.models import Account as AccountModel
 from ...config.settings import get_settings
 from ...services import EmailServiceFactory, EmailServiceType
+from ...services.imap_mail import get_imap_generated_domain, normalize_imap_address_mode
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -98,6 +99,21 @@ SENSITIVE_FIELDS = {
     'custom_auth',
 }
 
+
+def _normalize_domain_text(value: Any) -> str:
+    return str(value or "").strip().lower().lstrip("@").strip(".")
+
+
+def _compact_config_values(config: Dict[str, Any]) -> Dict[str, Any]:
+    compacted = {}
+    for key, value in (config or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        compacted[key] = value
+    return compacted
+
 def normalize_email_service_config(service_type: str, config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """兼容历史配置字段，避免不同入口写入的键名不一致。"""
     normalized = dict(config or {})
@@ -109,6 +125,21 @@ def normalize_email_service_config(service_type: str, config: Optional[Dict[str,
     if service_type == "cloudmail" and normalized.get("api_key") and not normalized.get("admin_password"):
         normalized["admin_password"] = normalized.pop("api_key")
 
+    if service_type == "imap_mail":
+        normalized["address_mode"] = normalize_imap_address_mode(normalized)
+        if "domain" in normalized:
+            normalized["domain"] = _normalize_domain_text(normalized.get("domain"))
+        if "subdomain" in normalized:
+            normalized["subdomain"] = _normalize_domain_text(normalized.get("subdomain"))
+
+    return normalized
+
+
+def validate_email_service_config(service_type: str, config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized = normalize_email_service_config(service_type, config)
+    if service_type == "imap_mail":
+        if normalize_imap_address_mode(normalized) == "catchall" and not get_imap_generated_domain(normalized):
+            raise HTTPException(status_code=400, detail="IMAP catchall 模式需要填写生成域名")
     return normalized
 
 
@@ -135,6 +166,10 @@ def filter_sensitive_config(config: Dict[str, Any]) -> Dict[str, Any]:
 def service_to_response(service: EmailServiceModel) -> EmailServiceResponse:
     """?????????"""
     normalized_config = normalize_email_service_config(service.service_type, service.config)
+    if service.service_type == "imap_mail":
+        generated_domain = get_imap_generated_domain(normalized_config)
+        if generated_domain:
+            normalized_config["generated_domain"] = generated_domain
     registration_status = None
     registered_account_id = None
     if service.service_type == "outlook":
@@ -328,13 +363,16 @@ async def get_service_types():
             {
                 "value": "imap_mail",
                 "label": "IMAP 邮箱",
-                "description": "标准 IMAP 协议邮箱（Gmail/QQ/163等），仅用于接收验证码，强制直连",
+                "description": "标准 IMAP 协议邮箱，可作为固定邮箱或 catchall 收件箱使用",
                 "config_fields": [
                     {"name": "host", "label": "IMAP 服务器", "required": True, "placeholder": "imap.gmail.com"},
                     {"name": "port", "label": "端口", "required": False, "default": 993},
                     {"name": "use_ssl", "label": "使用 SSL", "required": False, "default": True},
-                    {"name": "email", "label": "邮箱地址", "required": True},
+                    {"name": "address_mode", "label": "地址模式", "required": False, "default": "single"},
+                    {"name": "email", "label": "IMAP 登录/收件箱地址", "required": True},
                     {"name": "password", "label": "密码/授权码", "required": True, "secret": True},
+                    {"name": "domain", "label": "生成域名", "required": False, "placeholder": "example.com"},
+                    {"name": "subdomain", "label": "二级域名", "required": False, "placeholder": "test"},
                 ]
             },
             {
@@ -426,7 +464,7 @@ async def create_email_service(request: EmailServiceCreate):
         service = EmailServiceModel(
             service_type=request.service_type,
             name=request.name,
-            config=normalize_email_service_config(request.service_type, request.config),
+            config=validate_email_service_config(request.service_type, request.config),
             enabled=request.enabled,
             priority=request.priority
         )
@@ -452,9 +490,8 @@ async def update_email_service(service_id: int, request: EmailServiceUpdate):
             # 合并配置而不是替换
             current_config = normalize_email_service_config(service.service_type, service.config)
             merged_config = {**current_config, **request.config}
-            # 移除空值
-            merged_config = {k: v for k, v in merged_config.items() if v}
-            update_data["config"] = normalize_email_service_config(service.service_type, merged_config)
+            merged_config = _compact_config_values(merged_config)
+            update_data["config"] = validate_email_service_config(service.service_type, merged_config)
         if request.enabled is not None:
             update_data["enabled"] = request.enabled
         if request.priority is not None:

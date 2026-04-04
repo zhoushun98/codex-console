@@ -27,6 +27,13 @@ class DummySettings:
     registration_auto_cpa_service_id = 9
 
 
+class DummyOutlookSettings:
+    outlook_default_client_id = "client-123"
+    outlook_provider_priority = ["graph_api", "imap_old", "imap_new"]
+    outlook_health_failure_threshold = 6
+    outlook_health_disable_duration = 90
+
+
 def test_get_registration_settings_includes_auto_fields(monkeypatch):
     monkeypatch.setattr(settings_routes, "get_settings", lambda: DummySettings())
 
@@ -147,3 +154,62 @@ def test_update_registration_settings_rejects_missing_cpa_when_enabled():
         assert "必须选择一个 CPA 服务" in exc.detail
     else:
         raise AssertionError("expected HTTPException for missing CPA service")
+
+
+def test_update_registration_settings_rejects_legacy_catchall_imap_type():
+    request = settings_routes.RegistrationSettings(
+        auto_email_service_type="catchall_imap",
+    )
+
+    try:
+        asyncio.run(settings_routes.update_registration_settings(request))
+    except settings_routes.HTTPException as exc:
+        assert exc.status_code == 400
+        assert "邮箱服务类型无效" in exc.detail
+    else:
+        raise AssertionError("expected HTTPException for legacy catchall_imap type")
+
+
+def test_get_outlook_settings_includes_provider_priority(monkeypatch):
+    monkeypatch.setattr(settings_routes, "get_settings", lambda: DummyOutlookSettings())
+
+    result = asyncio.run(settings_routes.get_outlook_settings())
+
+    assert result["default_client_id"] == "client-123"
+    assert result["provider_priority"] == ["graph_api", "imap_old", "imap_new"]
+    assert result["health_failure_threshold"] == 6
+    assert result["health_disable_duration"] == 90
+
+
+def test_update_outlook_settings_persists_provider_priority(monkeypatch):
+    update_calls = []
+    monkeypatch.setattr(settings_routes, "update_settings", lambda **kwargs: update_calls.append(kwargs))
+
+    request = settings_routes.OutlookSettings(
+        default_client_id=" client-456 ",
+        provider_priority=[" graph_api ", "IMAP_OLD", "graph_api", "imap_new"],
+        health_failure_threshold=7,
+        health_disable_duration=120,
+    )
+
+    result = asyncio.run(settings_routes.update_outlook_settings(request))
+
+    assert result["success"] is True
+    assert update_calls == [{
+        "outlook_default_client_id": " client-456 ",
+        "outlook_provider_priority": ["graph_api", "imap_old", "imap_new"],
+        "outlook_health_failure_threshold": 7,
+        "outlook_health_disable_duration": 120,
+    }]
+
+
+def test_update_outlook_settings_rejects_invalid_provider_priority():
+    request = settings_routes.OutlookSettings(provider_priority=["graph_api", "invalid_provider"])
+
+    try:
+        asyncio.run(settings_routes.update_outlook_settings(request))
+    except settings_routes.HTTPException as exc:
+        assert exc.status_code == 400
+        assert "无效的 Outlook provider" in exc.detail
+    else:
+        raise AssertionError("expected HTTPException for invalid provider priority")

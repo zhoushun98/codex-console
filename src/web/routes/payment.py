@@ -22,6 +22,11 @@ from ...database.models import Account, BindCardTask, EmailService as EmailServi
 from ...config.settings import get_settings
 from ...config.constants import OPENAI_PAGE_TYPES
 from ...services import EmailServiceFactory, EmailServiceType
+from ...services.imap_mail import (
+    get_imap_generated_domain,
+    imap_service_matches_account,
+    normalize_imap_address_mode,
+)
 from ...core.register import RegistrationEngine
 from .accounts import resolve_account_ids
 from ...core.openai.payment import (
@@ -773,6 +778,12 @@ def _normalize_email_service_config_for_session_bootstrap(
     elif service_type == EmailServiceType.LUCKMAIL:
         if "domain" in normalized and "preferred_domain" not in normalized:
             normalized["preferred_domain"] = normalized.pop("domain")
+    elif service_type == EmailServiceType.IMAP_MAIL:
+        normalized["address_mode"] = normalize_imap_address_mode(normalized)
+        if "domain" in normalized:
+            normalized["domain"] = str(normalized.get("domain") or "").strip().lower().lstrip("@").strip(".")
+        if "subdomain" in normalized:
+            normalized["subdomain"] = str(normalized.get("subdomain") or "").strip().lower().lstrip("@").strip(".")
 
     # IMAP/Outlook 等可按需使用代理；Temp-Mail/Freemail 强制直连。
     if proxy_url and "proxy_url" not in normalized and service_type not in (EmailServiceType.TEMP_MAIL, EmailServiceType.FREEMAIL):
@@ -800,12 +811,17 @@ def _resolve_email_service_for_account_session_bootstrap(db, account: Account, p
 
     selected = None
     if services:
-        # Outlook/IMAP 优先匹配同邮箱配置，避免拿错账户。
-        if service_type in (EmailServiceType.OUTLOOK, EmailServiceType.IMAP_MAIL):
+        # Outlook/IMAP 优先匹配对应邮箱配置，避免拿错账户。
+        if service_type == EmailServiceType.OUTLOOK:
             email_lower = str(account.email or "").strip().lower()
             for svc in services:
                 cfg_email = str((svc.config or {}).get("email") or "").strip().lower()
                 if cfg_email and cfg_email == email_lower:
+                    selected = svc
+                    break
+        elif service_type == EmailServiceType.IMAP_MAIL:
+            for svc in services:
+                if imap_service_matches_account(svc.config, account.email):
                     selected = svc
                     break
         if not selected:
@@ -813,6 +829,14 @@ def _resolve_email_service_for_account_session_bootstrap(db, account: Account, p
 
     if selected and selected.config:
         config = _normalize_email_service_config_for_session_bootstrap(service_type, selected.config, proxy)
+        if service_type == EmailServiceType.IMAP_MAIL:
+            logger.info(
+                "会话补全选择 IMAP 服务: service_id=%s inbox=%s mode=%s generated_domain=%s",
+                selected.id,
+                config.get("email"),
+                config.get("address_mode"),
+                get_imap_generated_domain(config) or "-",
+            )
     elif service_type == EmailServiceType.TEMPMAIL:
         config = {
             "base_url": settings.tempmail_base_url,

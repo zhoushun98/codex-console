@@ -2434,6 +2434,7 @@ def _build_inbox_config(db, service_type, email: str) -> dict:
     """根据账号邮箱服务类型从数据库构建服务配置（不传 proxy_url）"""
     from ...database.models import EmailService as EmailServiceModel
     from ...services import EmailServiceType as EST
+    from ...services.imap_mail import imap_service_matches_account
 
     if service_type == EST.TEMPMAIL:
         settings = get_settings()
@@ -2496,6 +2497,11 @@ def _build_inbox_config(db, service_type, email: str) -> dict:
         # 按 config.email 匹配账号 email
         services = query.all()
         svc = next((s for s in services if (s.config or {}).get("email") == email), None)
+    elif service_type == EST.IMAP_MAIL:
+        services = query.order_by(EmailServiceModel.priority.asc()).all()
+        svc = next((s for s in services if imap_service_matches_account(s.config, email)), None)
+        if not svc and services:
+            svc = services[0]
     else:
         svc = query.order_by(EmailServiceModel.priority.asc()).first()
 

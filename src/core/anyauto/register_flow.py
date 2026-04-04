@@ -217,7 +217,7 @@ class AnyAutoRegistrationEngine:
                     return {"success": False, "error_message": last_error}
 
                 normalized_email = raw_email.lower()
-                self.inbox_email = raw_email
+                self.inbox_email = str((self.email_info or {}).get("inbox_email") or raw_email).strip()
                 self.email = normalized_email
                 try:
                     self.email_info["email"] = normalized_email
@@ -226,6 +226,8 @@ class AnyAutoRegistrationEngine:
 
                 if raw_email != normalized_email:
                     self._log(f"邮箱规范化: {raw_email} -> {normalized_email}")
+                if self.inbox_email.lower() != normalized_email:
+                    self._log(f"收件箱地址: {self.inbox_email}")
 
                 # 2. 生成密码 & 用户信息
                 self.password = self.password or self._build_password(password_len)

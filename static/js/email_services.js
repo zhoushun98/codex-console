@@ -62,6 +62,8 @@ const elements = {
     addFreemailFields: document.getElementById('add-freemail-fields'),
     addCloudmailFields: document.getElementById('add-cloudmail-fields'),
     addImapFields: document.getElementById('add-imap-fields'),
+    addImapAddressMode: document.getElementById('custom-imap-address-mode'),
+    addImapCatchallFields: document.getElementById('add-imap-catchall-fields'),
 
     // 编辑自定义域名模态框
     editCustomModal: document.getElementById('edit-custom-modal'),
@@ -77,6 +79,8 @@ const elements = {
     editFreemailFields: document.getElementById('edit-freemail-fields'),
     editCloudmailFields: document.getElementById('edit-cloudmail-fields'),
     editImapFields: document.getElementById('edit-imap-fields'),
+    editImapAddressMode: document.getElementById('edit-imap-address-mode'),
+    editImapCatchallFields: document.getElementById('edit-imap-catchall-fields'),
     editCustomTypeBadge: document.getElementById('edit-custom-type-badge'),
     editCustomSubTypeHidden: document.getElementById('edit-custom-sub-type-hidden'),
 
@@ -96,7 +100,7 @@ const CUSTOM_SUBTYPE_LABELS = {
     duckmail: '🦆 DuckMail（DuckMail API）',
     luckmail: 'LuckMail（接码平台）',
     freemail: 'Freemail（自部署 Cloudflare Worker）',
-    imap: '📧 IMAP 邮箱（Gmail/QQ/163等）'
+    imap: '📧 IMAP / Catchall 邮箱'
 };
 
 // 初始化
@@ -162,6 +166,8 @@ function initEventListeners() {
 
     // 类型切换（添加表单）
     elements.customSubType.addEventListener('change', (e) => switchAddSubType(e.target.value));
+    elements.addImapAddressMode?.addEventListener('change', (e) => toggleImapCatchallFields('add', e.target.value));
+    elements.editImapAddressMode?.addEventListener('change', (e) => toggleImapCatchallFields('edit', e.target.value));
 
     // 编辑自定义域名
     elements.closeEditCustomModal.addEventListener('click', () => elements.editCustomModal.classList.remove('active'));
@@ -208,6 +214,9 @@ function switchAddSubType(subType) {
     elements.addFreemailFields.style.display = subType === 'freemail' ? '' : 'none';
     elements.addCloudmailFields.style.display = subType === 'cloudmail' ? '' : 'none';
     elements.addImapFields.style.display = subType === 'imap' ? '' : 'none';
+    if (subType === 'imap') {
+        toggleImapCatchallFields('add', elements.addImapAddressMode?.value || 'single');
+    }
 }
 
 // 切换编辑表单子类型显示
@@ -223,6 +232,29 @@ function switchEditSubType(subType) {
     elements.editCloudmailFields.style.display = subType === 'cloudmail' ? '' : 'none';
     elements.editImapFields.style.display = subType === 'imap' ? '' : 'none';
     elements.editCustomTypeBadge.textContent = CUSTOM_SUBTYPE_LABELS[subType] || CUSTOM_SUBTYPE_LABELS.moemail;
+    if (subType === 'imap') {
+        toggleImapCatchallFields('edit', elements.editImapAddressMode?.value || 'single');
+    }
+}
+
+function toggleImapCatchallFields(scope, mode) {
+    const isCatchall = mode === 'catchall';
+    const fieldset = scope === 'edit' ? elements.editImapCatchallFields : elements.addImapCatchallFields;
+    if (fieldset) {
+        fieldset.style.display = isCatchall ? '' : 'none';
+    }
+}
+
+function getImapGeneratedDomain(config = {}) {
+    if (config.generated_domain) {
+        return config.generated_domain;
+    }
+    const domain = String(config.domain || '').trim().replace(/^@+/, '').replace(/\.+$/, '').toLowerCase();
+    const subdomain = String(config.subdomain || '').trim().replace(/^@+/, '').replace(/\.+$/, '').toLowerCase();
+    if (!domain) {
+        return '';
+    }
+    return subdomain ? `${subdomain}.${domain}` : domain;
 }
 
 // 加载统计信息
@@ -351,7 +383,12 @@ function getCustomServiceAddress(service) {
     if (service._subType === 'imap') {
         const host = service.config?.host || '-';
         const emailAddr = service.config?.email || '';
-        return `${escapeHtml(host)}<div style="color: var(--text-muted); margin-top: 4px;">${escapeHtml(emailAddr)}</div>`;
+        const addressMode = service.config?.address_mode || 'single';
+        const generatedDomain = getImapGeneratedDomain(service.config || {});
+        const modeText = addressMode === 'catchall'
+            ? `Catchall 生成域名：@${escapeHtml(generatedDomain || '-')}`
+            : '固定邮箱模式';
+        return `${escapeHtml(host)}<div style="color: var(--text-muted); margin-top: 4px;">收件箱：${escapeHtml(emailAddr || '-')}</div><div style="color: var(--text-muted); margin-top: 4px;">${modeText}</div>`;
     }
     if (service._subType === 'tempmail_builtin') {
         const baseUrl = service.config?.base_url || '-';
@@ -602,14 +639,28 @@ async function handleAddCustom(e) {
             config.subdomain = subdomain.trim();
         }
     } else {
+        const addressMode = formData.get('imap_address_mode') || 'single';
+        const generatedDomain = String(formData.get('imap_domain') || '').trim();
+        if (addressMode === 'catchall' && !generatedDomain) {
+            toast.error('IMAP catchall 模式需要填写生成域名');
+            return;
+        }
         serviceType = 'imap_mail';
         config = {
             host: formData.get('imap_host'),
             port: parseInt(formData.get('imap_port'), 10) || 993,
             use_ssl: formData.get('imap_use_ssl') !== 'false',
             email: formData.get('imap_email'),
-            password: formData.get('imap_password')
+            password: formData.get('imap_password'),
+            address_mode: addressMode,
+            domain: '',
+            subdomain: ''
         };
+        if (addressMode === 'catchall') {
+            config.domain = generatedDomain;
+            const subdomain = String(formData.get('imap_subdomain') || '').trim();
+            if (subdomain) config.subdomain = subdomain;
+        }
     }
 
     const data = {
@@ -855,9 +906,13 @@ async function editCustomService(id, subType) {
             document.getElementById('edit-imap-host').value = service.config?.host || '';
             document.getElementById('edit-imap-port').value = service.config?.port || 993;
             document.getElementById('edit-imap-use-ssl').value = service.config?.use_ssl !== false ? 'true' : 'false';
+            document.getElementById('edit-imap-address-mode').value = service.config?.address_mode || 'single';
             document.getElementById('edit-imap-email').value = service.config?.email || '';
+            document.getElementById('edit-imap-domain').value = service.config?.domain || '';
+            document.getElementById('edit-imap-subdomain').value = service.config?.subdomain || '';
             document.getElementById('edit-imap-password').value = '';
             document.getElementById('edit-imap-password').placeholder = service.config?.password ? '已设置，留空保持不变' : '请输入密码/授权码';
+            toggleImapCatchallFields('edit', service.config?.address_mode || 'single');
         }
 
         elements.editCustomModal.classList.add('active');
@@ -948,12 +1003,26 @@ async function handleEditCustom(e) {
         const pwd = formData.get('cm_admin_password');
         if (pwd && pwd.trim()) config.admin_password = pwd.trim();
     } else {
+        const addressMode = formData.get('imap_address_mode') || 'single';
+        const generatedDomain = String(formData.get('imap_domain') || '').trim();
+        if (addressMode === 'catchall' && !generatedDomain) {
+            toast.error('IMAP catchall 模式需要填写生成域名');
+            return;
+        }
         config = {
             host: formData.get('imap_host'),
             port: parseInt(formData.get('imap_port'), 10) || 993,
             use_ssl: formData.get('imap_use_ssl') !== 'false',
-            email: formData.get('imap_email')
+            email: formData.get('imap_email'),
+            address_mode: addressMode,
+            domain: '',
+            subdomain: ''
         };
+        if (addressMode === 'catchall') {
+            config.domain = generatedDomain;
+            const subdomain = String(formData.get('imap_subdomain') || '').trim();
+            if (subdomain) config.subdomain = subdomain;
+        }
         const pwd = formData.get('imap_password');
         if (pwd && pwd.trim()) config.password = pwd.trim();
     }

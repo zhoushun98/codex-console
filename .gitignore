@@ -56,3 +56,6 @@ Thumbs.db
 # Project specific
 backups/
 /out/
+/task_plan.md
+/findings.md
+/progress.md

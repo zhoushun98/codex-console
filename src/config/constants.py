@@ -210,8 +210,11 @@ EMAIL_SERVICE_DEFAULTS = {
         "host": "",
         "port": 993,
         "use_ssl": True,
+        "address_mode": "single",
         "email": "",
         "password": "",
+        "domain": "",
+        "subdomain": "",
         "timeout": 30,
         "max_retries": 3,
     }

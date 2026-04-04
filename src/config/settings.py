@@ -521,7 +521,7 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
     # 验证码配置
     "email_code_timeout": SettingDefinition(
         db_key="email_code.timeout",
-        default_value=120,
+        default_value=60,
         category=SettingCategory.EMAIL,
         description="验证码等待超时时间（秒）"
     ),
@@ -535,7 +535,7 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
     # Outlook 配置
     "outlook_provider_priority": SettingDefinition(
         db_key="outlook.provider_priority",
-        default_value=["imap_old", "imap_new", "graph_api"],
+        default_value=["graph_api", "imap_old", "imap_new"],
         category=SettingCategory.EMAIL,
         description="Outlook 提供者优先级"
     ),
@@ -920,11 +920,11 @@ class Settings(BaseModel):
     cpa_api_token: SecretStr = SecretStr("")
 
     # 验证码配置
-    email_code_timeout: int = 120
+    email_code_timeout: int = 60
     email_code_poll_interval: int = 3
 
     # Outlook 配置
-    outlook_provider_priority: List[str] = ["imap_old", "imap_new", "graph_api"]
+    outlook_provider_priority: List[str] = ["graph_api", "imap_old", "imap_new"]
     outlook_health_failure_threshold: int = 5
     outlook_health_disable_duration: int = 60
     outlook_default_client_id: str = "24d9a0ed-8787-4584-883c-2fd79308940a"

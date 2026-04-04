@@ -38,6 +38,28 @@ DEFAULT_PROVIDER_PRIORITY = [
 OTP_TIME_SKEW_SECONDS = 5
 
 
+def _normalize_provider_priority(raw_priority: Optional[List[Any]]) -> List[ProviderType]:
+    """Normalize provider priority values and drop invalid entries."""
+    normalized: List[ProviderType] = []
+    seen = set()
+    invalid_values: List[str] = []
+
+    for item in raw_priority or []:
+        value = str(item or "").strip().lower()
+        if not value or value in seen:
+            continue
+        try:
+            normalized.append(ProviderType(value))
+            seen.add(value)
+        except ValueError:
+            invalid_values.append(value)
+
+    if invalid_values:
+        logger.warning("忽略无效的 Outlook provider_priority 配置: %s", invalid_values)
+
+    return normalized
+
+
 def get_email_code_settings() -> dict:
     """获取验证码等待配置"""
     settings = get_settings()
@@ -69,12 +91,27 @@ class OutlookService(BaseEmailService):
         """
         super().__init__(ServiceType.OUTLOOK, name)
 
+        try:
+            settings = get_settings()
+        except Exception:
+            settings = None
+
+        configured_priority = _normalize_provider_priority(
+            getattr(settings, "outlook_provider_priority", None) if settings else None
+        )
+
         # 默认配置
         default_config = {
             "accounts": [],
-            "provider_priority": [p.value for p in DEFAULT_PROVIDER_PRIORITY],
-            "health_failure_threshold": 5,
-            "health_disable_duration": 60,
+            "provider_priority": [
+                p.value for p in (configured_priority or DEFAULT_PROVIDER_PRIORITY)
+            ],
+            "health_failure_threshold": int(
+                getattr(settings, "outlook_health_failure_threshold", 5) if settings else 5
+            ),
+            "health_disable_duration": int(
+                getattr(settings, "outlook_health_disable_duration", 60) if settings else 60
+            ),
             "timeout": 30,
             "proxy_url": None,
         }
@@ -82,9 +119,9 @@ class OutlookService(BaseEmailService):
         self.config = {**default_config, **(config or {})}
 
         # 解析提供者优先级
-        self.provider_priority = [
-            ProviderType(p) for p in self.config.get("provider_priority", [])
-        ]
+        self.provider_priority = _normalize_provider_priority(
+            self.config.get("provider_priority", [])
+        )
         if not self.provider_priority:
             self.provider_priority = DEFAULT_PROVIDER_PRIORITY
 
@@ -97,10 +134,10 @@ class OutlookService(BaseEmailService):
         )
 
         # 获取默认 client_id（供无 client_id 的账户使用）
-        try:
-            _default_client_id = get_settings().outlook_default_client_id
-        except Exception:
-            _default_client_id = "24d9a0ed-8787-4584-883c-2fd79308940a"
+        _default_client_id = (
+            getattr(settings, "outlook_default_client_id", None)
+            if settings else None
+        ) or "24d9a0ed-8787-4584-883c-2fd79308940a"
 
         # 解析账户
         self.accounts: List[OutlookAccount] = []

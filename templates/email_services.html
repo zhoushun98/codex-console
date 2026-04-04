@@ -245,7 +245,7 @@
                             <option value="duckmail">DuckMail（DuckMail API）</option>
                             <option value="luckmail">LuckMail（接码平台）</option>
                             <option value="freemail">Freemail（自部署 Cloudflare Worker）</option>
-                            <option value="imap">标准 IMAP（Gmail/QQ/163等）</option>
+                            <option value="imap">标准 IMAP / Catchall</option>
                         </select>
                     </div>
                     <!-- MoeMail 字段 -->
@@ -398,12 +398,30 @@
                             </div>
                         </div>
                         <div class="form-group">
-                            <label for="custom-imap-email">邮箱地址</label>
+                            <label for="custom-imap-address-mode">地址模式</label>
+                            <select id="custom-imap-address-mode" name="imap_address_mode">
+                                <option value="single">固定邮箱模式</option>
+                                <option value="catchall">Catchall 收件箱模式</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="custom-imap-email">IMAP 登录 / 收件箱地址</label>
                             <input type="email" id="custom-imap-email" name="imap_email" placeholder="your@gmail.com">
                         </div>
                         <div class="form-group">
                             <label for="custom-imap-password">密码 / 授权码</label>
                             <input type="password" id="custom-imap-password" name="imap_password" placeholder="Gmail 需使用 App Password，QQ/163 需使用授权码">
+                        </div>
+                        <div id="add-imap-catchall-fields" style="display:none;">
+                            <div class="form-group">
+                                <label for="custom-imap-domain">生成域名</label>
+                                <input type="text" id="custom-imap-domain" name="imap_domain" placeholder="example.com">
+                            </div>
+                            <div class="form-group">
+                                <label for="custom-imap-subdomain">二级域名（可选）</label>
+                                <input type="text" id="custom-imap-subdomain" name="imap_subdomain" placeholder="test">
+                                <small style="color: var(--text-muted);">例如填写 test，则生成的邮箱为 xxx@test.example.com</small>
+                            </div>
                         </div>
                     </div>
                     <div id="add-cloudmail-fields" style="display:none;">
@@ -627,13 +645,31 @@
                             </div>
                         </div>
                         <div class="form-group">
-                            <label for="edit-imap-email">邮箱地址</label>
+                            <label for="edit-imap-address-mode">地址模式</label>
+                            <select id="edit-imap-address-mode" name="imap_address_mode">
+                                <option value="single">固定邮箱模式</option>
+                                <option value="catchall">Catchall 收件箱模式</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="edit-imap-email">IMAP 登录 / 收件箱地址</label>
                             <input type="email" id="edit-imap-email" name="imap_email" placeholder="your@gmail.com">
                         </div>
                         <div class="form-group">
                             <label for="edit-imap-password">密码 / 授权码</label>
                             <input type="password" id="edit-imap-password" name="imap_password" placeholder="留空则保持原值不变">
                             <small style="color: var(--text-muted);">留空则保持原值不变</small>
+                        </div>
+                        <div id="edit-imap-catchall-fields" style="display:none;">
+                            <div class="form-group">
+                                <label for="edit-imap-domain">生成域名</label>
+                                <input type="text" id="edit-imap-domain" name="imap_domain" placeholder="example.com">
+                            </div>
+                            <div class="form-group">
+                                <label for="edit-imap-subdomain">二级域名（可选）</label>
+                                <input type="text" id="edit-imap-subdomain" name="imap_subdomain" placeholder="test">
+                                <small style="color: var(--text-muted);">例如填写 test，则生成的邮箱为 xxx@test.example.com</small>
+                            </div>
                         </div>
                     </div>
                     <!-- CloudMail 字段 -->
@@ -738,4 +774,3 @@
     {% include "partials/site_footer.html" %}
 </body>
 </html>
-

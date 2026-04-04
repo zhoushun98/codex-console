@@ -11,8 +11,11 @@ from src.web.routes import registration as registration_routes
 
 
 class DummySettings:
+    tempmail_enabled = False
     custom_domain_base_url = ""
     custom_domain_api_key = None
+    yyds_mail_enabled = False
+    yyds_mail_api_key = None
 
 
 def test_duck_mail_service_registered():

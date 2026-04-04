@@ -9,7 +9,7 @@ import time
 import logging
 import random
 import string
-import requests
+from curl_cffi import requests
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 

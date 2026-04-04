@@ -26,6 +26,7 @@ from ...core.register import (
     RegistrationCancelledError,
 )
 from ...services import EmailServiceFactory, EmailServiceType
+from ...services.imap_mail import get_imap_generated_domain, normalize_imap_address_mode
 from ...config.settings import get_settings, Settings
 from ...core.auto_registration import (
     add_auto_registration_log,
@@ -336,11 +337,115 @@ def _normalize_email_service_config(
     elif service_type == EmailServiceType.LUCKMAIL:
         if 'domain' in normalized and 'preferred_domain' not in normalized:
             normalized['preferred_domain'] = normalized.pop('domain')
+    elif service_type == EmailServiceType.IMAP_MAIL:
+        normalized["address_mode"] = normalize_imap_address_mode(normalized)
+        if "domain" in normalized:
+            normalized["domain"] = str(normalized.get("domain") or "").strip().lower().lstrip("@").strip(".")
+        if "subdomain" in normalized:
+            normalized["subdomain"] = str(normalized.get("subdomain") or "").strip().lower().lstrip("@").strip(".")
 
     if proxy_url and 'proxy_url' not in normalized:
         normalized['proxy_url'] = proxy_url
 
     return normalized
+
+
+def _extract_registration_metadata(result_payload: Optional[dict]) -> Dict[str, Any]:
+    payload = result_payload if isinstance(result_payload, dict) else {}
+    metadata = payload.get("metadata") if isinstance(payload, dict) else {}
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _is_retryable_registration_failure(error_message: Optional[str]) -> bool:
+    text = str(error_message or "").strip().lower()
+    if not text:
+        return False
+
+    non_retryable_markers = (
+        "unsupported country",
+        "invalid email service",
+        "email service not found",
+    )
+    if any(marker in text for marker in non_retryable_markers):
+        return False
+
+    retryable_markers = (
+        "access_token",
+        "refresh_token",
+        "session",
+        "oauth",
+        "callback",
+        "workspace",
+        "workspace_id",
+        "continue_url",
+        "redirect",
+        "重定向",
+        "跟随重定向链失败",
+        "获取 continue_url 失败",
+        "auth-info",
+        "phone",
+        "add-phone",
+        "add_phone",
+        "sentinel",
+        "verification code",
+        "otp",
+        "tls connect error",
+        "invalid library",
+        "network error",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    )
+    return any(marker in text for marker in retryable_markers)
+
+
+def _classify_registration_task_outcome(task) -> Dict[str, bool]:
+    status = str(getattr(task, "status", "") or "").strip().lower()
+    metadata = _extract_registration_metadata(getattr(task, "result", None))
+    completion_path = str(metadata.get("completion_path") or "").strip().lower()
+    token_pending = bool(metadata.get("token_pending"))
+    fallback_success = completion_path == "anyauto_fallback" or bool(metadata.get("fallback_attempted"))
+    degraded_success = False
+    retryable_failure = False
+
+    if status == "completed":
+        degraded_success = fallback_success or token_pending or completion_path in {
+            "auth_session_fallback",
+            "account_created_pending",
+        }
+    elif status == "failed":
+        retryable_failure = _is_retryable_registration_failure(getattr(task, "error_message", ""))
+
+    return {
+        "degraded_success": degraded_success,
+        "fallback_success": fallback_success if status == "completed" else False,
+        "retryable_failure": retryable_failure,
+        "token_pending": token_pending,
+    }
+
+
+def _describe_registration_success(task) -> str:
+    metadata = _extract_registration_metadata(getattr(task, "result", None))
+    completion_path = str(metadata.get("completion_path") or "").strip().lower()
+    token_pending = bool(metadata.get("token_pending"))
+    labels: List[str] = []
+
+    if completion_path == "anyauto_fallback" or bool(metadata.get("fallback_attempted")):
+        labels.append("anyauto 回退")
+    elif completion_path == "auth_session_fallback":
+        labels.append("auth/session 兜底")
+
+    if token_pending or completion_path == "account_created_pending":
+        labels.append("token 待补")
+
+    if not labels:
+        return "注册成功"
+    return f"注册成功（{'，'.join(labels)}）"
 
 
 def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, auto_upload_new_api: bool = False, new_api_service_ids: List[int] = None, registration_type: str = RoleTag.CHILD.value):
@@ -380,6 +485,10 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             if not task:
                 logger.error(f"任务不存在: {task_uuid}")
                 return
+
+            # 从任务记录中恢复 email_service_id（Outlook 批量任务预分配账户时设置）
+            if email_service_id is None and task.email_service_id:
+                email_service_id = task.email_service_id
 
             # 更新 TaskManager 状态
             task_manager.update_status(task_uuid, "running")
@@ -478,9 +587,10 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     # 找到一个未注册的 Outlook 账户
                     selected_service = None
                     for svc in outlook_services:
-                        email = svc.config.get("email") if svc.config else None
+                        email = (svc.config.get("email") if svc.config else None)
                         if not email:
                             continue
+                        email = email.strip().lower()
                         # 检查是否已在 accounts 表中注册
                         existing = db.query(Account).filter(Account.email == email).first()
                         if not existing:
@@ -634,6 +744,13 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 # 保存到数据库
                 _raise_if_cancelled("任务在保存账户前收到取消请求，停止后处理")
                 engine.save_to_database(result, account_label=account_label, role_tag=role_tag)
+
+                completion_path = str(metadata.get("completion_path") or "primary_oauth").strip()
+                token_pending = bool(metadata.get("token_pending"))
+                if completion_path and completion_path != "primary_oauth":
+                    log_callback(f"[注册] 本次完成路径: {completion_path}")
+                if token_pending:
+                    log_callback("[注册] 账号已保存，但 access_token 待补；本次自动上传会按无 token 自动跳过")
 
                 if callable(marker) and result.email:
                     try:
@@ -876,12 +993,16 @@ def _init_batch_state(batch_id: str, task_uuids: List[str]):
         "total": len(task_uuids),
         "completed": 0,
         "success": 0,
+        "degraded_success": 0,
+        "fallback_success": 0,
         "failed": 0,
+        "retryable_failure": 0,
         "cancelled": False,
         "task_uuids": task_uuids,
         "current_index": 0,
         "logs": [],
-        "finished": False
+        "finished": False,
+        "next_wait_force_max": False,
     }
 
 
@@ -898,6 +1019,24 @@ def _make_batch_helpers(batch_id: str):
         task_manager.update_batch_status(batch_id, **kwargs)
 
     return add_batch_log, update_batch_status
+
+
+async def _sleep_pipeline_interval(
+    batch_id: str,
+    interval_min: int,
+    interval_max: int,
+    add_batch_log,
+) -> None:
+    if interval_max <= 0:
+        return
+
+    wait_time = random.randint(interval_min, interval_max)
+    if batch_tasks.get(batch_id, {}).pop("next_wait_force_max", False):
+        wait_time = interval_max
+        add_batch_log(f"[系统] 检测到回退成功、token 待补或可重试失败，下一次启动间隔使用最大值 {wait_time} 秒")
+
+    logger.info(f"批量任务 {batch_id}: 等待 {wait_time} 秒后启动下一个任务")
+    await asyncio.sleep(wait_time)
 
 
 async def run_batch_parallel(
@@ -955,16 +1094,35 @@ async def run_batch_parallel(
             t = crud.get_registration_task(db, uuid)
             if t:
                 async with counter_lock:
+                    outcome = _classify_registration_task_outcome(t)
                     new_completed = batch_tasks[batch_id]["completed"] + 1
                     new_success = batch_tasks[batch_id]["success"]
+                    new_degraded = batch_tasks[batch_id]["degraded_success"]
+                    new_fallback = batch_tasks[batch_id]["fallback_success"]
                     new_failed = batch_tasks[batch_id]["failed"]
+                    new_retryable = batch_tasks[batch_id]["retryable_failure"]
                     if t.status == "completed":
                         new_success += 1
-                        add_batch_log(f"{prefix} [成功] 注册成功")
+                        if outcome["degraded_success"]:
+                            new_degraded += 1
+                        if outcome["fallback_success"]:
+                            new_fallback += 1
+                        add_batch_log(f"{prefix} [成功] {_describe_registration_success(t)}")
                     elif t.status == "failed":
                         new_failed += 1
-                        add_batch_log(f"{prefix} [失败] 注册失败: {t.error_message}")
-                    update_batch_status(completed=new_completed, success=new_success, failed=new_failed)
+                        if outcome["retryable_failure"]:
+                            new_retryable += 1
+                            add_batch_log(f"{prefix} [失败/可重试] 注册失败: {t.error_message}")
+                        else:
+                            add_batch_log(f"{prefix} [失败] 注册失败: {t.error_message}")
+                    update_batch_status(
+                        completed=new_completed,
+                        success=new_success,
+                        degraded_success=new_degraded,
+                        fallback_success=new_fallback,
+                        failed=new_failed,
+                        retryable_failure=new_retryable,
+                    )
 
     try:
         await asyncio.gather(*[_run_one(i, u) for i, u in enumerate(task_uuids)], return_exceptions=True)
@@ -1038,16 +1196,37 @@ async def run_batch_pipeline(
                 t = crud.get_registration_task(db, uuid)
                 if t:
                     async with counter_lock:
+                        outcome = _classify_registration_task_outcome(t)
                         new_completed = batch_tasks[batch_id]["completed"] + 1
                         new_success = batch_tasks[batch_id]["success"]
+                        new_degraded = batch_tasks[batch_id]["degraded_success"]
+                        new_fallback = batch_tasks[batch_id]["fallback_success"]
                         new_failed = batch_tasks[batch_id]["failed"]
+                        new_retryable = batch_tasks[batch_id]["retryable_failure"]
                         if t.status == "completed":
                             new_success += 1
-                            add_batch_log(f"{pfx} [成功] 注册成功")
+                            if outcome["degraded_success"]:
+                                new_degraded += 1
+                                batch_tasks[batch_id]["next_wait_force_max"] = True
+                            if outcome["fallback_success"]:
+                                new_fallback += 1
+                            add_batch_log(f"{pfx} [成功] {_describe_registration_success(t)}")
                         elif t.status == "failed":
                             new_failed += 1
-                            add_batch_log(f"{pfx} [失败] 注册失败: {t.error_message}")
-                        update_batch_status(completed=new_completed, success=new_success, failed=new_failed)
+                            if outcome["retryable_failure"]:
+                                new_retryable += 1
+                                batch_tasks[batch_id]["next_wait_force_max"] = True
+                                add_batch_log(f"{pfx} [失败/可重试] 注册失败: {t.error_message}")
+                            else:
+                                add_batch_log(f"{pfx} [失败] 注册失败: {t.error_message}")
+                        update_batch_status(
+                            completed=new_completed,
+                            success=new_success,
+                            degraded_success=new_degraded,
+                            fallback_success=new_fallback,
+                            failed=new_failed,
+                            retryable_failure=new_retryable,
+                        )
         finally:
             semaphore.release()
 
@@ -1069,9 +1248,7 @@ async def run_batch_pipeline(
             running_tasks_list.append(t)
 
             if i < len(task_uuids) - 1 and not task_manager.is_batch_cancelled(batch_id):
-                wait_time = random.randint(interval_min, interval_max)
-                logger.info(f"批量任务 {batch_id}: 等待 {wait_time} 秒后启动下一个任务")
-                await asyncio.sleep(wait_time)
+                await _sleep_pipeline_interval(batch_id, interval_min, interval_max, add_batch_log)
 
         if running_tasks_list:
             await asyncio.gather(*running_tasks_list, return_exceptions=True)
@@ -1402,7 +1579,7 @@ async def _start_outlook_batch_registration_internal(
                     continue
 
                 config = service.config or {}
-                email = config.get("email") or service.name
+                email = (config.get("email") or service.name or "").strip().lower()
                 existing_account = db.query(Account).filter(Account.email == email).first()
                 if existing_account:
                     skipped_count += 1
@@ -1596,7 +1773,10 @@ async def get_batch_status(batch_id: str):
         "total": batch["total"],
         "completed": batch["completed"],
         "success": batch["success"],
+        "degraded_success": batch.get("degraded_success", 0),
+        "fallback_success": batch.get("fallback_success", 0),
         "failed": batch["failed"],
+        "retryable_failure": batch.get("retryable_failure", 0),
         "current_index": batch["current_index"],
         "cancelled": batch["cancelled"],
         "finished": batch.get("finished", False),
@@ -2005,12 +2185,16 @@ async def get_available_email_services():
 
         for service in imap_mail_services:
             config = service.config or {}
+            normalized = _normalize_email_service_config(EmailServiceType.IMAP_MAIL, config)
+            generated_domain = get_imap_generated_domain(normalized)
             result["imap_mail"]["services"].append({
                 "id": service.id,
                 "name": service.name,
                 "type": "imap_mail",
-                "email": config.get("email"),
-                "host": config.get("host"),
+                "email": normalized.get("email"),
+                "host": normalized.get("host"),
+                "address_mode": normalized.get("address_mode"),
+                "generated_domain": generated_domain or None,
                 "priority": service.priority
             })
 
@@ -2112,6 +2296,7 @@ async def run_outlook_batch_registration(
     tm_service_ids: List[int] = None,
     auto_upload_new_api: bool = False,
     new_api_service_ids: List[int] = None,
+    registration_type: str = RoleTag.CHILD.value,
 ):
     """
     异步执行 Outlook 批量注册任务，复用通用并发逻辑
@@ -2157,6 +2342,7 @@ async def run_outlook_batch_registration(
         tm_service_ids=tm_service_ids,
         auto_upload_new_api=auto_upload_new_api,
         new_api_service_ids=new_api_service_ids,
+        registration_type=registration_type,
     )
 
 
@@ -2189,7 +2375,10 @@ async def get_outlook_batch_status(batch_id: str):
         "total": batch["total"],
         "completed": batch["completed"],
         "success": batch["success"],
+        "degraded_success": batch.get("degraded_success", 0),
+        "fallback_success": batch.get("fallback_success", 0),
         "failed": batch["failed"],
+        "retryable_failure": batch.get("retryable_failure", 0),
         "skipped": batch.get("skipped", 0),
         "current_index": batch["current_index"],
         "cancelled": batch["cancelled"],
@@ -2392,4 +2581,3 @@ async def delete_scheduled_registration_job(job_uuid: str):
             raise HTTPException(status_code=400, detail="无法删除执行中的计划任务")
         crud.delete_scheduled_registration_job(db, job_uuid)
         return {'success': True, 'message': '计划任务已删除'}
-

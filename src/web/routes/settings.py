@@ -4,7 +4,7 @@
 
 import logging
 import os
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
@@ -17,6 +17,7 @@ from ...core.auto_registration import (
 from ...database import crud
 from ...database.session import get_db
 from ...services import EmailServiceType
+from ...services.outlook.base import ProviderType
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -361,10 +362,6 @@ async def update_registration_settings(request: RegistrationSettings):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="自动注册邮箱服务类型无效") from exc
 
-    normalized_auto_email_service_type = (
-        "imap_mail" if request.auto_email_service_type == "catchall_imap" else request.auto_email_service_type
-    )
-
     if request.auto_interval_min < 0 or request.auto_interval_max < request.auto_interval_min:
         raise HTTPException(status_code=400, detail="自动注册间隔时间参数无效")
 
@@ -387,10 +384,7 @@ async def update_registration_settings(request: RegistrationSettings):
             email_service = crud.get_email_service_by_id(db, request.auto_email_service_id)
             if not email_service or not email_service.enabled:
                 raise HTTPException(status_code=400, detail="自动注册选择的邮箱服务不存在或已禁用")
-            normalized_service_type = (
-                "imap_mail" if email_service.service_type == "catchall_imap" else email_service.service_type
-            )
-            if normalized_service_type != normalized_auto_email_service_type:
+            if email_service.service_type != request.auto_email_service_type:
                 raise HTTPException(status_code=400, detail="自动注册邮箱服务类型与指定服务不匹配")
 
     update_settings(
@@ -403,7 +397,7 @@ async def update_registration_settings(request: RegistrationSettings):
         registration_auto_enabled=request.auto_enabled,
         registration_auto_check_interval=request.auto_check_interval,
         registration_auto_min_ready_auth_files=request.auto_min_ready_auth_files,
-        registration_auto_email_service_type=normalized_auto_email_service_type,
+        registration_auto_email_service_type=request.auto_email_service_type,
         registration_auto_email_service_id=max(0, request.auto_email_service_id),
         registration_auto_proxy=(request.auto_proxy or "").strip(),
         registration_auto_interval_min=request.auto_interval_min,
@@ -1021,6 +1015,38 @@ async def disable_proxy(proxy_id: int):
 class OutlookSettings(BaseModel):
     """Outlook 设置"""
     default_client_id: Optional[str] = None
+    provider_priority: Optional[List[str]] = None
+    health_failure_threshold: Optional[int] = None
+    health_disable_duration: Optional[int] = None
+
+
+def _normalize_outlook_provider_priority(priority: Optional[List[str]]) -> Optional[List[str]]:
+    if priority is None:
+        return None
+
+    normalized: List[str] = []
+    seen = set()
+    valid_values = {item.value for item in ProviderType}
+
+    for item in priority:
+        value = str(item or "").strip().lower()
+        if not value or value in seen:
+            continue
+        if value not in valid_values:
+            raise HTTPException(
+                status_code=400,
+                detail=f"无效的 Outlook provider: {value}"
+            )
+        normalized.append(value)
+        seen.add(value)
+
+    if not normalized:
+        raise HTTPException(
+            status_code=400,
+            detail="provider_priority 不能为空"
+        )
+
+    return normalized
 
 
 @router.get("/outlook")
@@ -1043,6 +1069,18 @@ async def update_outlook_settings(request: OutlookSettings):
 
     if request.default_client_id is not None:
         update_dict["outlook_default_client_id"] = request.default_client_id
+    if request.provider_priority is not None:
+        update_dict["outlook_provider_priority"] = _normalize_outlook_provider_priority(request.provider_priority)
+    if request.health_failure_threshold is not None:
+        threshold = int(request.health_failure_threshold)
+        if threshold < 1:
+            raise HTTPException(status_code=400, detail="health_failure_threshold 必须大于 0")
+        update_dict["outlook_health_failure_threshold"] = threshold
+    if request.health_disable_duration is not None:
+        duration = int(request.health_disable_duration)
+        if duration < 1:
+            raise HTTPException(status_code=400, detail="health_disable_duration 必须大于 0")
+        update_dict["outlook_health_disable_duration"] = duration
 
     if update_dict:
         update_settings(**update_dict)

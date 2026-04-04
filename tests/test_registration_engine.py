@@ -4,7 +4,7 @@ import json
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
-from src.core.register import RegistrationEngine
+from src.core.register import RegistrationEngine, RegistrationResult
 from src.services.base import BaseEmailService
 
 
@@ -74,6 +74,7 @@ class FakeEmailService(BaseEmailService):
         self.otp_requests.append({
             "email": email,
             "email_id": email_id,
+            "timeout": timeout,
             "otp_sent_at": otp_sent_at,
         })
         if not self.codes:
@@ -88,6 +89,21 @@ class FakeEmailService(BaseEmailService):
 
     def check_health(self):
         return True
+
+
+class FakeOutlookEmailService(FakeEmailService):
+    def __init__(self, codes):
+        super().__init__(codes)
+        self.service_type = EmailServiceType.OUTLOOK
+
+
+class FakeCatchallEmailService(FakeEmailService):
+    def create_email(self, config=None):
+        return {
+            "email": "tester@test.example.com",
+            "inbox_email": "admin@catchall.example.com",
+            "service_id": "mailbox-1",
+        }
 
 
 class FakeOAuthManager:
@@ -294,3 +310,312 @@ def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
     assert len(email_service.otp_requests) == 1
     assert email_service.otp_requests[0]["otp_sent_at"] is not None
     assert result.metadata["token_acquired_via_relogin"] is False
+
+
+def test_get_verification_code_uses_registration_email_for_catchall_inbox():
+    email_service = FakeCatchallEmailService(["135790"])
+    engine = RegistrationEngine(email_service)
+    engine._otp_sent_at = 1234567890
+
+    assert engine._create_email() is True
+    code = engine._get_verification_code(timeout=12)
+
+    assert code == "135790"
+    assert engine.email == "tester@test.example.com"
+    assert engine.inbox_email == "admin@catchall.example.com"
+    assert email_service.otp_requests[0]["email"] == "tester@test.example.com"
+    assert email_service.otp_requests[0]["email_id"] == "mailbox-1"
+
+
+def test_get_verification_code_uses_settings_timeout_by_default(monkeypatch):
+    email_service = FakeEmailService(["246810"])
+    engine = RegistrationEngine(email_service)
+    engine._otp_sent_at = 1234567890
+
+    assert engine._create_email() is True
+
+    monkeypatch.setattr(
+        "src.core.register.get_settings",
+        lambda: type("Settings", (), {"email_code_timeout": 77})(),
+    )
+
+    code = engine._get_verification_code()
+
+    assert code == "246810"
+    assert email_service.otp_requests[0]["timeout"] == 77
+
+
+def test_verify_email_otp_with_retry_resends_once_when_no_code(monkeypatch):
+    engine = RegistrationEngine(FakeEmailService([]))
+    codes = iter([None, "246810"])
+    resend_calls = []
+    validated_codes = []
+
+    monkeypatch.setattr(engine, "_get_verification_code", lambda timeout=None: next(codes))
+    monkeypatch.setattr(
+        engine,
+        "_send_verification_code",
+        lambda referer=None: resend_calls.append(referer) or True,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_validate_verification_code",
+        lambda code: validated_codes.append(code) or True,
+    )
+
+    ok = engine._verify_email_otp_with_retry(
+        stage_label="注册验证码",
+        max_attempts=3,
+        resend_on_empty=True,
+    )
+
+    assert ok is True
+    assert resend_calls == ["https://auth.openai.com/email-verification"]
+    assert validated_codes == ["246810"]
+
+
+def test_should_try_anyauto_fallback_covers_redirect_failure(monkeypatch):
+    engine = RegistrationEngine(FakeEmailService([]))
+    monkeypatch.setattr(
+        "src.core.register.get_settings",
+        lambda: type("Settings", (), {"registration_enable_anyauto_fallback": True})(),
+    )
+
+    result = RegistrationResult(success=False)
+    result.error_message = "跟随重定向链失败"
+
+    assert engine._should_try_anyauto_fallback(result) is True
+
+
+def test_complete_token_exchange_outlook_uses_auth_session_fallback():
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.password = "Passw0rd!"
+    engine.device_id = "did-1"
+    engine._is_existing_account = False
+    engine._last_validate_otp_workspace_id = ""
+    engine._last_validate_otp_continue_url = "https://auth.openai.com/add-phone"
+    engine._create_account_continue_url = "https://auth.openai.com/add-phone"
+    engine._create_account_account_id = "acct-1"
+    engine._create_account_workspace_id = "ws-1"
+    engine._create_account_refresh_token = "refresh-1"
+    engine.oauth_start = OAuthStart(
+        auth_url="https://auth.example.test/authorize",
+        state="state-1",
+        code_verifier="verifier-1",
+        redirect_uri="http://localhost:1455/auth/callback",
+    )
+    engine.session = type("Session", (), {"cookies": {"__Secure-next-auth.session-token": "session-1"}})()
+
+    engine._verify_email_otp_with_retry = lambda **kwargs: True
+    engine._get_workspace_id = lambda: ""
+    engine._follow_redirects = lambda _url: ("", "https://chatgpt.com/")
+
+    def fake_capture(result, access_hint=None):
+        result.access_token = "access-1"
+        result.session_token = "session-1"
+        return True
+
+    engine._capture_auth_session_tokens = fake_capture
+
+    result = RegistrationResult(success=False)
+    ok = engine._complete_token_exchange_outlook(result)
+
+    assert ok is True
+    assert result.access_token == "access-1"
+    assert result.account_id == "acct-1"
+    assert result.workspace_id == "ws-1"
+    assert result.metadata["completion_path"] == "auth_session_fallback"
+    assert result.metadata.get("token_pending") is not True
+
+
+def test_complete_token_exchange_outlook_backfills_session_token_after_callback(monkeypatch):
+    engine = RegistrationEngine(FakeOutlookEmailService([]))
+    engine.oauth_manager = FakeOAuthManager()
+    engine.password = "Passw0rd!"
+    engine.device_id = "did-1"
+    engine.oauth_start = OAuthStart(
+        auth_url="https://auth.example.test/authorize",
+        state="state-1",
+        code_verifier="verifier-1",
+        redirect_uri="http://localhost:1455/auth/callback",
+    )
+    engine.session = type("Session", (), {"cookies": {}})()
+
+    monkeypatch.setattr(engine, "_verify_email_otp_with_retry", lambda **kwargs: True)
+    monkeypatch.setattr(engine, "_get_workspace_id", lambda: "ws-1")
+    monkeypatch.setattr(engine, "_select_workspace", lambda workspace_id: "https://auth.example.test/continue")
+    monkeypatch.setattr(
+        engine,
+        "_follow_redirects",
+        lambda _url: ("http://localhost:1455/auth/callback?code=code-1&state=state-1", "https://chatgpt.com/"),
+    )
+    capture_calls = []
+
+    def fake_capture(result, access_hint=None):
+        capture_calls.append(access_hint)
+        result.session_token = "session-outlook"
+        return True
+
+    monkeypatch.setattr(engine, "_capture_auth_session_tokens", fake_capture)
+    monkeypatch.setattr(engine, "_bootstrap_chatgpt_signin_for_session", lambda result: False)
+
+    result = RegistrationResult(success=False)
+    ok = engine._complete_token_exchange_outlook(result)
+
+    assert ok is True
+    assert result.access_token == "access-1"
+    assert result.session_token == "session-outlook"
+    assert capture_calls == ["access-1"]
+
+
+def test_run_outlook_registration_marks_token_pending_when_account_already_created(monkeypatch):
+    email_service = FakeOutlookEmailService(["111111", "222222"])
+    engine = RegistrationEngine(email_service)
+    engine.oauth_manager = FakeOAuthManager()
+
+    monkeypatch.setattr(engine, "_check_ip_location", lambda: (True, "SG"))
+
+    def fake_create_email():
+        engine.email = "outlook@example.com"
+        engine.inbox_email = "outlook@example.com"
+        engine.email_info = {"service_id": "mailbox-1"}
+        return True
+
+    monkeypatch.setattr(engine, "_create_email", fake_create_email)
+
+    def fake_prepare_authorize_flow(_label):
+        engine.oauth_start = OAuthStart(
+            auth_url="https://auth.example.test/authorize",
+            state="state-1",
+            code_verifier="verifier-1",
+            redirect_uri="http://localhost:1455/auth/callback",
+        )
+        engine.session = type("Session", (), {"cookies": {}})()
+        engine.device_id = "did-1"
+        return "did-1", "sen-1"
+
+    monkeypatch.setattr(engine, "_prepare_authorize_flow", fake_prepare_authorize_flow)
+    monkeypatch.setattr(
+        engine,
+        "_submit_signup_form",
+        lambda _did, _sen: type("SignupResult", (), {"success": True, "error_message": "", "page_type": "create_account_password"})(),
+    )
+    monkeypatch.setattr(engine, "_register_password_with_retry", lambda _did, _sen: (True, "Passw0rd!"))
+    monkeypatch.setattr(engine, "_send_verification_code", lambda referer=None: True)
+    monkeypatch.setattr(engine, "_verify_email_otp_with_retry", lambda **kwargs: True)
+
+    def fake_create_user_account():
+        engine._create_account_account_id = "acct-pending"
+        engine._create_account_workspace_id = "ws-pending"
+        engine._create_account_refresh_token = "refresh-pending"
+        engine._create_account_continue_url = "https://auth.openai.com/add-phone"
+        return True
+
+    monkeypatch.setattr(engine, "_create_user_account", fake_create_user_account)
+    monkeypatch.setattr(engine, "_restart_login_flow", lambda: (True, ""))
+    monkeypatch.setattr(engine, "_get_workspace_id", lambda: "")
+    monkeypatch.setattr(engine, "_follow_redirects", lambda _url: ("", "https://auth.example.test/authorize"))
+    monkeypatch.setattr(engine, "_capture_auth_session_tokens", lambda result, access_hint=None: False)
+
+    result = engine.run()
+
+    assert result.success is True
+    assert result.account_id == "acct-pending"
+    assert result.workspace_id == "ws-pending"
+    assert result.access_token == ""
+    assert result.metadata["registration_entry_flow_effective"] == "outlook"
+    assert result.metadata["completion_path"] == "account_created_pending"
+    assert result.metadata["token_pending"] is True
+
+
+def test_complete_token_exchange_native_backup_backfills_session_token_after_callback(monkeypatch):
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.oauth_manager = FakeOAuthManager()
+    engine.password = "Passw0rd!"
+    engine.device_id = "did-1"
+    engine.oauth_start = OAuthStart(
+        auth_url="https://auth.example.test/authorize",
+        state="state-1",
+        code_verifier="verifier-1",
+        redirect_uri="http://localhost:1455/auth/callback",
+    )
+    engine.session = type("Session", (), {"cookies": {}})()
+
+    monkeypatch.setattr(engine, "_verify_email_otp_with_retry", lambda **kwargs: True)
+    monkeypatch.setattr(engine, "_get_workspace_id", lambda: "ws-1")
+    monkeypatch.setattr(engine, "_select_workspace", lambda workspace_id: "https://auth.example.test/continue")
+    monkeypatch.setattr(
+        engine,
+        "_follow_redirects",
+        lambda _url: ("http://localhost:1455/auth/callback?code=code-1&state=state-1", "https://chatgpt.com/"),
+    )
+    capture_calls = []
+
+    def fake_capture(result, access_hint=None):
+        capture_calls.append(access_hint)
+        result.session_token = "session-native"
+        return True
+
+    monkeypatch.setattr(engine, "_capture_auth_session_tokens", fake_capture)
+    monkeypatch.setattr(engine, "_bootstrap_chatgpt_signin_for_session", lambda result: False)
+
+    result = RegistrationResult(success=False)
+    ok = engine._complete_token_exchange_native_backup(result)
+
+    assert ok is True
+    assert result.access_token == "access-1"
+    assert result.session_token == "session-native"
+    assert capture_calls == ["access-1"]
+
+
+def test_bridge_login_for_session_token_prioritizes_chatgpt_callback_continue_url(monkeypatch):
+    engine = RegistrationEngine(FakeOutlookEmailService([]))
+    engine.email = "bridge@example.com"
+    engine.password = "Passw0rd!"
+    engine.device_id = "did-1"
+    engine._last_validate_otp_continue_url = "https://chatgpt.com/api/auth/callback/openai?code=bridge-code"
+    engine.session = type(
+        "Session",
+        (),
+        {"cookies": type("Cookies", (dict,), {"set": lambda self, key, value, domain=None, path=None: self.__setitem__(key, value)})()},
+    )()
+
+    monkeypatch.setattr(engine, "_check_sentinel", lambda did: "sen-1")
+    monkeypatch.setattr(
+        engine,
+        "_submit_login_start",
+        lambda did, sen: type(
+            "SignupResult",
+            (),
+            {
+                "success": True,
+                "page_type": OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"],
+                "error_message": "",
+            },
+        )(),
+    )
+    monkeypatch.setattr(engine, "_verify_email_otp_with_retry", lambda **kwargs: True)
+    monkeypatch.setattr(engine, "_warmup_chatgpt_session", lambda: None)
+    monkeypatch.setattr(engine, "_select_workspace", lambda workspace_id: (_ for _ in ()).throw(AssertionError("workspace fallback should not run")))
+    follow_calls = []
+    capture_calls = []
+
+    def fake_follow(url):
+        follow_calls.append(url)
+        return (url, "https://chatgpt.com/")
+
+    def fake_capture(result, access_hint=None):
+        capture_calls.append(access_hint)
+        result.session_token = "session-bridge"
+        return True
+
+    monkeypatch.setattr(engine, "_follow_chatgpt_auth_redirects", fake_follow)
+    monkeypatch.setattr(engine, "_capture_auth_session_tokens", fake_capture)
+
+    result = RegistrationResult(success=False, access_token="access-1")
+    ok = engine._bridge_login_for_session_token(result)
+
+    assert ok is True
+    assert result.session_token == "session-bridge"
+    assert follow_calls == ["https://chatgpt.com/api/auth/callback/openai?code=bridge-code"]
+    assert capture_calls == ["access-1"]

@@ -103,3 +103,29 @@ def test_auto_registration_immediate_check_keeps_regular_interval(monkeypatch):
 
     assert len(plan_calls) >= 2
     assert auto_registration.get_auto_registration_state()["last_checked_at"] is not None
+
+
+def test_auto_registration_stop_does_not_hang_while_waiting(monkeypatch):
+    class MutableSettings:
+        registration_auto_enabled = False
+        registration_auto_check_interval = 60
+        registration_auto_min_ready_auth_files = 1
+
+    settings = MutableSettings()
+
+    async def fake_trigger_callback(plan, current_settings):
+        return None
+
+    monkeypatch.setattr(auto_registration, "add_auto_registration_log", lambda message: None)
+
+    async def scenario():
+        coordinator = auto_registration.AutoRegistrationCoordinator(
+            trigger_callback=fake_trigger_callback,
+            settings_getter=lambda: settings,
+        )
+
+        coordinator.start()
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(coordinator.stop(), timeout=1)
+
+    asyncio.run(scenario())

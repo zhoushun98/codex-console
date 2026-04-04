@@ -27,6 +27,7 @@ from .utils import (
     random_delay,
     seed_oai_device_cookie,
 )
+from ...config.settings import get_settings
 
 
 # Chrome 指纹配置
@@ -58,6 +59,16 @@ def _random_chrome_version():
     full_ver = f"{major}.0.{build}.{patch}"
     ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{full_ver} Safari/537.36"
     return profile["impersonate"], major, full_ver, ua, profile["sec_ch_ua"]
+
+
+def _get_email_code_timeout(default: int = 90) -> int:
+    """Return the configured OTP wait timeout with a safe fallback."""
+    try:
+        settings = get_settings()
+        configured = int(getattr(settings, "email_code_timeout", default) or default)
+    except Exception:
+        configured = default
+    return max(1, configured)
 
 
 class ChatGPTClient:
@@ -121,6 +132,31 @@ class ChatGPTClient:
         """在 headed 模式下加入轻微停顿，模拟有头浏览器节奏。"""
         if self.browser_mode == "headed":
             random_delay(low, high)
+
+    def _wait_for_email_otp_with_single_resend(self, email, skymail_client, timeout, otp_sent_at=None):
+        """Wait for OTP once, then resend a single time if no mail arrives."""
+        effective_timeout = max(1, int(timeout or 1))
+        first_sent_at = otp_sent_at if otp_sent_at is not None else time.time()
+        otp_code = skymail_client.wait_for_verification_code(
+            email,
+            timeout=effective_timeout,
+            otp_sent_at=first_sent_at,
+        )
+        if otp_code:
+            return otp_code
+
+        self._log("首轮等待未收到验证码，尝试自动重发一次...")
+        resend_sent_at = time.time()
+        if not self.send_email_otp():
+            self._log("自动重发验证码失败")
+            return None
+
+        self._log("验证码已重发，继续等待新邮件...")
+        return skymail_client.wait_for_verification_code(
+            email,
+            timeout=effective_timeout,
+            otp_sent_at=resend_sent_at,
+        )
 
     def _headers(
         self,
@@ -803,6 +839,7 @@ class ChatGPTClient:
         otp_verified = False
         account_created = False
         seen_states = {}
+        initial_otp_sent_at = None
 
         for _ in range(12):
             signature = self._state_signature(state)
@@ -823,14 +860,22 @@ class ChatGPTClient:
                 if not success:
                     return False, f"注册失败: {msg}"
                 register_submitted = True
+                initial_otp_sent_at = time.time()
                 if not self.send_email_otp():
                     self._log("发送验证码接口返回失败，继续等待邮箱中的验证码...")
+                    initial_otp_sent_at = None
                 state = self._state_from_url(f"{self.AUTH}/email-verification")
                 continue
 
             if self._state_is_email_otp(state):
-                self._log("等待邮箱验证码...")
-                otp_code = skymail_client.wait_for_verification_code(email, timeout=90)
+                email_code_timeout = _get_email_code_timeout(default=90)
+                self._log(f"等待邮箱验证码...（超时 {email_code_timeout}s）")
+                otp_code = self._wait_for_email_otp_with_single_resend(
+                    email,
+                    skymail_client,
+                    timeout=email_code_timeout,
+                    otp_sent_at=initial_otp_sent_at,
+                )
                 if not otp_code:
                     return False, "未收到验证码"
 
@@ -856,9 +901,10 @@ class ChatGPTClient:
                         return False, f"验证码失败: {next_state}"
 
                     self._log("验证码疑似过期/错误，尝试获取新验证码...")
+                    retry_email_code_timeout = _get_email_code_timeout(default=45)
                     otp_code = skymail_client.wait_for_verification_code(
                         email,
-                        timeout=45,
+                        timeout=retry_email_code_timeout,
                         exclude_codes=tried_codes,
                     )
                     if not otp_code:

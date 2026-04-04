@@ -151,6 +151,7 @@ class AutoRegistrationCoordinator:
     def start(self) -> None:
         if self._task and not self._task.done():
             return
+        self._wake_event.clear()
         update_auto_registration_state(
             enabled=bool(self._settings_getter().registration_auto_enabled),
             status="idle",
@@ -163,7 +164,6 @@ class AutoRegistrationCoordinator:
     async def stop(self) -> None:
         if not self._task:
             return
-        self._wake_event.set()
         self._task.cancel()
         try:
             await self._task
@@ -171,6 +171,7 @@ class AutoRegistrationCoordinator:
             pass
         finally:
             self._task = None
+            self._wake_event.clear()
 
     def request_immediate_check(self) -> None:
         self._wake_event.set()

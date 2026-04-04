@@ -523,7 +523,10 @@ function updateEmailServiceOptions() {
         availableServices.imap_mail.services.forEach(service => {
             const option = document.createElement('option');
             option.value = `imap_mail:${service.id}`;
-            option.textContent = service.name + (service.email ? ` (${service.email})` : '');
+            const suffix = service.address_mode === 'catchall'
+                ? ` (catchall @${service.generated_domain || '-'})`
+                : (service.email ? ` (${service.email})` : '');
+            option.textContent = service.name + suffix;
             option.dataset.type = 'imap_mail';
             option.dataset.serviceId = service.id;
             optgroup.appendChild(option);
@@ -599,7 +602,10 @@ function handleServiceChange(e) {
     } else if (type === 'imap_mail') {
         const service = availableServices.imap_mail.services.find(s => s.id == id);
         if (service) {
-            addLog('info', `[系统] 已选择 IMAP 邮箱服务: ${service.name}`);
+            const detail = service.address_mode === 'catchall'
+                ? `${service.name}，收件箱 ${service.email || '-'}，生成域名 @${service.generated_domain || '-'}`
+                : `${service.name}${service.email ? ` (${service.email})` : ''}`;
+            addLog('info', `[系统] 已选择 IMAP 邮箱服务: ${detail}`);
         }
     }
 }
